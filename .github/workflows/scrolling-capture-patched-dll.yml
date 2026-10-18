@@ -1,0 +1,213 @@
+name: Sync upstream and build scrolling capture fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - develop
+    paths:
+      - ".github/workflows/scrolling-capture-patched-dll.yml"
+      - "patches/scrolling-capture-focus-retry.diff"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Sync and build replacement DLL
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          ref: develop
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        shell: pwsh
+        run: |
+          if (-not (git remote | Select-String -SimpleMatch "upstream")) {
+            git remote add upstream https://github.com/ShareX/ShareX.git
+          }
+          git fetch upstream develop --prune
+
+      - name: Sync fork develop with upstream
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          $before = (git rev-parse HEAD).Trim()
+          git merge --no-edit upstream/develop
+          if ($LASTEXITCODE -ne 0) {
+            throw "Upstream merge failed. Resolve the conflict before building a replacement DLL."
+          }
+
+          $after = (git rev-parse HEAD).Trim()
+          if ($after -ne $before) {
+            git push origin HEAD:develop
+            if ($LASTEXITCODE -ne 0) {
+              throw "Merged upstream successfully, but could not push the updated develop branch."
+            }
+          }
+
+      - name: Find latest successful official dev build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+            "User-Agent" = "Meteoni-ShareX-patched-dll"
+          }
+
+          $runs = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/ShareX/ShareX/actions/runs?branch=develop&per_page=100"
+          $run = $runs.workflow_runs |
+            Where-Object { $_.name -eq "Build ShareX" -and $_.status -eq "completed" -and $_.conclusion -eq "success" } |
+            Select-Object -First 1
+
+          if ($null -eq $run) {
+            throw "Could not find a successful upstream ShareX dev build."
+          }
+
+          "UPSTREAM_SHA=$($run.head_sha)" >> $env:GITHUB_ENV
+          "UPSTREAM_RUN_NUMBER=$($run.run_number)" >> $env:GITHUB_ENV
+          "UPSTREAM_RUN_ID=$($run.id)" >> $env:GITHUB_ENV
+
+          Write-Host "Official dev build: run $($run.run_number), commit $($run.head_sha)"
+
+      - name: Prepare exact upstream dev source
+        shell: pwsh
+        run: |
+          $patchCopy = Join-Path $env:RUNNER_TEMP "scrolling-capture-focus-retry.diff"
+          Copy-Item "patches\scrolling-capture-focus-retry.diff" $patchCopy -Force
+
+          git fetch upstream $env:UPSTREAM_SHA
+          git checkout --detach $env:UPSTREAM_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not check out upstream commit $env:UPSTREAM_SHA."
+          }
+
+          "PATCH_FILE=$patchCopy" >> $env:GITHUB_ENV
+
+      - name: Apply scrolling capture fix
+        shell: pwsh
+        run: |
+          git apply --check --ignore-space-change "$env:PATCH_FILE"
+          if ($LASTEXITCODE -ne 0) {
+            throw "The scrolling-capture patch no longer applies cleanly to upstream. Review upstream changes before rebuilding."
+          }
+
+          git apply --ignore-space-change "$env:PATCH_FILE"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to apply the scrolling-capture patch."
+          }
+
+          $manager = "ShareX.ScreenCaptureLib\ScrollingCaptureManager.cs"
+          $source = Get-Content $manager -Raw
+
+          if ($source.Contains("using Bitmap = SkiaSharp.SKBitmap;")) {
+            $old = "Result = (Bitmap)previousScreenshot.Clone();"
+            $new = "Result = previousScreenshot.Copy();"
+
+            if (-not $source.Contains($old)) {
+              throw "Patch applied, but the expected pre-Skia clone expression was not found."
+            }
+
+            $source = $source.Replace($old, $new)
+            [System.IO.File]::WriteAllText(
+              (Resolve-Path $manager),
+              $source,
+              [System.Text.UTF8Encoding]::new($true)
+            )
+          }
+
+          $source = Get-Content $manager -Raw
+          if (-not $source.Contains("EnsureSelectedWindowActivatedAsync") -or
+              -not $source.Contains("ScrollRetryCount")) {
+            throw "Patch verification failed."
+          }
+
+      - name: Match official dev build version
+        shell: pwsh
+        run: |
+          $path = "Directory.build.props"
+          $content = Get-Content $path -Raw
+          $pattern = '<Version>([0-9]+(?:\.[0-9]+){1,2})</Version>'
+          $match = [regex]::Match($content, $pattern)
+
+          if (-not $match.Success) {
+            throw "Could not determine ShareX base version."
+          }
+
+          $version = "$($match.Groups[1].Value).$env:UPSTREAM_RUN_NUMBER"
+          $content = [regex]::Replace($content, $pattern, "<Version>$version</Version>")
+          [System.IO.File]::WriteAllText(
+            (Resolve-Path $path),
+            $content,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+          "APP_VERSION=$version" >> $env:GITHUB_ENV
+          Write-Host "Replacement DLL version: $version"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore --runtime win-x64 ShareX.sln
+
+      - name: Build Release x64
+        run: dotnet build --no-restore --configuration Release -p:Platform=x64 --self-contained true /m ShareX.sln
+
+      - name: Package replacement DLL
+        shell: pwsh
+        run: |
+          $output = "ShareX\bin\Release\win-x64"
+          $dll = Join-Path $output "ShareX.ScreenCaptureLib.dll"
+
+          if (-not (Test-Path $dll)) {
+            throw "Built ShareX.ScreenCaptureLib.dll was not found at $dll."
+          }
+
+          New-Item -ItemType Directory -Path "replacement" -Force | Out-Null
+          Copy-Item $dll "replacement\ShareX.ScreenCaptureLib.dll" -Force
+
+          $pdb = Join-Path $output "ShareX.ScreenCaptureLib.pdb"
+          if (Test-Path $pdb) {
+            Copy-Item $pdb "replacement\ShareX.ScreenCaptureLib.pdb" -Force
+          }
+
+          $hash = (Get-FileHash $dll -Algorithm SHA256).Hash
+          $manifest = @"
+          ShareX scrolling capture replacement DLL
+          Version: $env:APP_VERSION
+          Upstream commit: $env:UPSTREAM_SHA
+          Upstream build run: $env:UPSTREAM_RUN_NUMBER
+          Upstream workflow run ID: $env:UPSTREAM_RUN_ID
+          Patch: scrolling-capture-focus-retry
+          SHA256: $hash
+          Built UTC: $([DateTime]::UtcNow.ToString("u"))
+          "@
+
+          Set-Content -Path "replacement\MANIFEST.txt" -Value $manifest.Trim() -NoNewline
+          "DLL_SHA256=$hash" >> $env:GITHUB_ENV
+
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### ShareX.ScreenCaptureLib.dll"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Version: `$env:APP_VERSION`"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Upstream: `$env:UPSTREAM_SHA`"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- SHA256: `$hash`"
+
+      - name: Upload replacement DLL
+        uses: actions/upload-artifact@v7
+        with:
+          name: ShareX.ScreenCaptureLib-${{ env.APP_VERSION }}-scroll-fix
+          path: replacement
+          retention-days: 30
