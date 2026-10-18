@@ -1,0 +1,225 @@
+diff --git a/ShareX.ScreenCaptureLib/ScrollingCaptureManager.cs b/ShareX.ScreenCaptureLib/ScrollingCaptureManager.cs
+index 8ba8d3e7839..507dbdcfbf6 100644
+--- a/ShareX.ScreenCaptureLib/ScrollingCaptureManager.cs
++++ b/ShareX.ScreenCaptureLib/ScrollingCaptureManager.cs
+@@ -40,6 +40,10 @@ internal class ScrollingCaptureManager : IDisposable
+         public Bitmap Result { get; private set; }
+         public bool IsCapturing { get; private set; }
+ 
++        private const int ActivationRetryCount = 5;
++        private const int ActivationRetryDelay = 50;
++        private const int ScrollRetryCount = 2;
++
+         private Bitmap lastScreenshot;
+         private Bitmap previousScreenshot;
+         private bool stopRequested;
+@@ -101,9 +105,15 @@ public async Task<ScrollingCaptureStatus> StartCapture()
+ 
+                 try
+                 {
+-                    selectedWindow.Activate();
++                    if (Options.StartDelay > 0)
++                    {
++                        await Task.Delay(Options.StartDelay);
++                    }
+ 
+-                    await Task.Delay(Options.StartDelay);
++                    if (!await EnsureSelectedWindowActivatedAsync())
++                    {
++                        return status;
++                    }
+ 
+                     if (Options.AutoScrollTop)
+                     {
+@@ -111,6 +121,11 @@ public async Task<ScrollingCaptureStatus> StartCapture()
+                         NativeMethods.SendMessage(selectedWindow.Handle, (int)WindowsMessages.VSCROLL, (int)ScrollBarCommands.SB_TOP, 0);
+ 
+                         await Task.Delay(Options.ScrollDelay);
++
++                        if (!await EnsureSelectedWindowActivatedAsync())
++                        {
++                            return status;
++                        }
+                     }
+ 
+                     Screenshot screenshot = new Screenshot()
+@@ -118,52 +133,34 @@ public async Task<ScrollingCaptureStatus> StartCapture()
+                         CaptureCursor = false
+                     };
+ 
+-                    while (!stopRequested)
++                    previousScreenshot = screenshot.CaptureRectangle(selectedRectangle);
++
++                    if (previousScreenshot == null)
+                     {
+-                        lastScreenshot = screenshot.CaptureRectangle(selectedRectangle);
++                        return status;
++                    }
+ 
+-                        if (CompareLastTwoImages())
+-                        {
+-                            break;
+-                        }
++                    Result = (Bitmap)previousScreenshot.Clone();
++                    status = ScrollingCaptureStatus.Successful;
+ 
+-                        switch (Options.ScrollMethod)
++                    int scrollRetry = 0;
++
++                    while (!stopRequested)
++                    {
++                        if (!await EnsureSelectedWindowActivatedAsync())
+                         {
+-                            case ScrollMethod.MouseWheel:
+-                                InputHelpers.SendMouseWheel(-120 * Options.ScrollAmount);
+-                                break;
+-                            case ScrollMethod.DownArrow:
+-                                for (int i = 0; i < Options.ScrollAmount; i++)
+-                                {
+-                                    InputHelpers.SendKeyPress(VirtualKeyCode.DOWN);
+-                                }
+-                                break;
+-                            case ScrollMethod.PageDown:
+-                                InputHelpers.SendKeyPress(VirtualKeyCode.NEXT);
+-                                break;
+-                            case ScrollMethod.ScrollMessage:
+-                                for (int i = 0; i < Options.ScrollAmount; i++)
+-                                {
+-                                    NativeMethods.SendMessage(selectedWindow.Handle, (int)WindowsMessages.VSCROLL, (int)ScrollBarCommands.SB_LINEDOWN, 0);
+-                                }
+-                                break;
++                            status = ScrollingCaptureStatus.Failed;
++                            break;
+                         }
+ 
+                         Stopwatch timer = Stopwatch.StartNew();
++                        SendScroll();
+ 
+-                        if (lastScreenshot != null)
+-                        {
+-                            Bitmap newResult = await CombineImagesAsync(Result, lastScreenshot);
++                        int delay = Options.ScrollDelay - (int)timer.ElapsedMilliseconds;
+ 
+-                            if (newResult != null)
+-                            {
+-                                Result?.Dispose();
+-                                Result = newResult;
+-                            }
+-                            else
+-                            {
+-                                break;
+-                            }
++                        if (delay > 0)
++                        {
++                            await Task.Delay(delay);
+                         }
+ 
+                         if (stopRequested)
+@@ -171,23 +168,51 @@ public async Task<ScrollingCaptureStatus> StartCapture()
+                             break;
+                         }
+ 
+-                        if (lastScreenshot != null)
++                        lastScreenshot = screenshot.CaptureRectangle(selectedRectangle);
++
++                        if (lastScreenshot == null)
++                        {
++                            status = ScrollingCaptureStatus.Failed;
++                            break;
++                        }
++
++                        if (CompareLastTwoImages())
+                         {
+-                            if (previousScreenshot != null)
++                            if (scrollRetry < ScrollRetryCount)
+                             {
+-                                previousScreenshot.Dispose();
++                                scrollRetry++;
++                                lastScreenshot.Dispose();
++                                lastScreenshot = null;
++                                continue;
+                             }
+ 
+-                            previousScreenshot = lastScreenshot;
+-                            lastScreenshot = null;
++                            break;
+                         }
+ 
+-                        int delay = Options.ScrollDelay - (int)timer.ElapsedMilliseconds;
++                        ScrollingCaptureStatus previousStatus = status;
++                        Bitmap newResult = await CombineImagesAsync(Result, lastScreenshot);
+ 
+-                        if (delay > 0)
++                        if (newResult == null)
+                         {
+-                            await Task.Delay(delay);
++                            if (scrollRetry < ScrollRetryCount)
++                            {
++                                status = previousStatus;
++                                scrollRetry++;
++                                lastScreenshot.Dispose();
++                                lastScreenshot = null;
++                                continue;
++                            }
++
++                            break;
+                         }
++
++                        Result?.Dispose();
++                        Result = newResult;
++                        scrollRetry = 0;
++
++                        previousScreenshot.Dispose();
++                        previousScreenshot = lastScreenshot;
++                        lastScreenshot = null;
+                     }
+                 }
+                 finally
+@@ -223,6 +248,47 @@ public async Task<bool> SelectWindowAsync()
+             return selectedWindow != null;
+         }
+ 
++        private async Task<bool> EnsureSelectedWindowActivatedAsync()
++        {
++            for (int i = 0; i < ActivationRetryCount; i++)
++            {
++                if (NativeMethods.GetForegroundWindow() == selectedWindow.Handle)
++                {
++                    return true;
++                }
++
++                selectedWindow.Activate();
++                await Task.Delay(ActivationRetryDelay);
++            }
++
++            return NativeMethods.GetForegroundWindow() == selectedWindow.Handle;
++        }
++
++        private void SendScroll()
++        {
++            switch (Options.ScrollMethod)
++            {
++                case ScrollMethod.MouseWheel:
++                    InputHelpers.SendMouseWheel(-120 * Options.ScrollAmount);
++                    break;
++                case ScrollMethod.DownArrow:
++                    for (int i = 0; i < Options.ScrollAmount; i++)
++                    {
++                        InputHelpers.SendKeyPress(VirtualKeyCode.DOWN);
++                    }
++                    break;
++                case ScrollMethod.PageDown:
++                    InputHelpers.SendKeyPress(VirtualKeyCode.NEXT);
++                    break;
++                case ScrollMethod.ScrollMessage:
++                    for (int i = 0; i < Options.ScrollAmount; i++)
++                    {
++                        NativeMethods.SendMessage(selectedWindow.Handle, (int)WindowsMessages.VSCROLL, (int)ScrollBarCommands.SB_LINEDOWN, 0);
++                    }
++                    break;
++            }
++        }
++
+         private bool IsScrollReachedBottom(IntPtr handle)
+         {
+             SCROLLINFO scrollInfo = new SCROLLINFO();
