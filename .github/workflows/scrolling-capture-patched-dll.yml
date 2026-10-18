@@ -201,9 +201,9 @@ jobs:
 
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### ShareX.ScreenCaptureLib.dll"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Version: `$env:APP_VERSION`"
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- Upstream: `$env:UPSTREAM_SHA`"
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- SHA256: `$hash`"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ("- Version: " + $env:APP_VERSION)
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ("- Upstream: " + $env:UPSTREAM_SHA)
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ("- SHA256: " + $hash)
 
       - name: Upload replacement DLL
         uses: actions/upload-artifact@v7
